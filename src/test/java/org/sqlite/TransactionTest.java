@@ -1,25 +1,17 @@
 package org.sqlite;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 import java.io.File;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.Arrays;
+import java.sql.*;
 import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.sqlite.SQLiteConfig.TransactionMode;
 
 /**
@@ -33,18 +25,9 @@ public class TransactionTest {
 
     boolean done = false;
 
-    @BeforeAll
-    public static void forName() throws Exception {
-        System.out.println(
-                "running in "
-                        + (SQLiteJDBCLoader.isNativeMode() ? "native" : "pure-java")
-                        + " mode");
-    }
-
     @BeforeEach
-    public void connect() throws Exception {
-        File tmpFile = File.createTempFile("test-trans", ".db");
-        // tmpFile.deleteOnExit();
+    public void connect(@TempDir File tempDir) throws Exception {
+        File tmpFile = File.createTempFile("test-trans", ".db", tempDir);
 
         Properties prop = new Properties();
         prop.setProperty("shared_cache", "false");
@@ -56,12 +39,6 @@ public class TransactionTest {
         stat1 = conn1.createStatement();
         stat2 = conn2.createStatement();
         stat3 = conn3.createStatement();
-
-        //        if (SQLiteJDBCLoader.isPureJavaMode()) {
-        //            stat1.setQueryTimeout(3);
-        //            stat2.setQueryTimeout(3);
-        //            stat3.setQueryTimeout(3);
-        //        }
     }
 
     @AfterEach
@@ -105,7 +82,7 @@ public class TransactionTest {
                 throw e;
             }
         }
-        assertTrue(gotException);
+        assertThat(gotException).isTrue();
         conn2.rollback();
         // The test would fail here: the trivial "transaction" created in between the rollback we
         // just
@@ -122,16 +99,15 @@ public class TransactionTest {
         } else {
             stat2.execute("insert into test values (3);");
         }
-        ;
         conn2.setAutoCommit(true);
 
         final ResultSet rs = stat1.executeQuery("select c1 from test");
-        final Set<Integer> seen = new HashSet<Integer>();
+        final Set<Integer> seen = new HashSet<>();
         while (rs.next()) {
-            assertTrue(seen.add(rs.getInt(1)));
+            assertThat(seen.add(rs.getInt(1))).isTrue();
         }
 
-        assertEquals(new HashSet<Integer>(Arrays.asList(1, 2, 3)), seen);
+        assertThat(seen).containsExactlyInAnyOrder(1, 2, 3);
     }
 
     @Test
@@ -152,13 +128,13 @@ public class TransactionTest {
         stat3.executeUpdate("insert into test values (3);");
 
         ResultSet rs = stat1.executeQuery("select sum(c1) from test;");
-        assertTrue(rs.next());
-        assertEquals(rs.getInt(1), 6);
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(6);
         rs.close();
 
         rs = stat3.executeQuery("select sum(c1) from test;");
-        assertTrue(rs.next());
-        assertEquals(rs.getInt(1), 6);
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(6);
         rs.close();
     }
 
@@ -177,24 +153,24 @@ public class TransactionTest {
         stat1.executeUpdate("create table trans (c1);");
         conn1.setAutoCommit(false);
 
-        assertEquals(1, stat1.executeUpdate("insert into trans values (4);"));
+        assertThat(stat1.executeUpdate("insert into trans values (4);")).isEqualTo(1);
 
-        // transaction not yet commited, conn1 can see, conn2 can not
+        // transaction not yet committed, conn1 can see, conn2 can not
         rs = stat1.executeQuery(countSql);
-        assertTrue(rs.next());
-        assertEquals(1, rs.getInt(1));
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(1);
         rs.close();
         rs = stat2.executeQuery(countSql);
-        assertTrue(rs.next());
-        assertEquals(0, rs.getInt(1));
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(0);
         rs.close();
 
         conn1.commit();
 
         // all connects can see data
         rs = stat2.executeQuery(countSql);
-        assertTrue(rs.next());
-        assertEquals(1, rs.getInt(1));
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(1);
         rs.close();
     }
 
@@ -208,13 +184,13 @@ public class TransactionTest {
         stat1.executeUpdate("insert into trans values (3);");
 
         rs = stat1.executeQuery(select);
-        assertTrue(rs.next());
+        assertThat(rs.next()).isTrue();
         rs.close();
 
         conn1.rollback();
 
         rs = stat1.executeQuery(select);
-        assertFalse(rs.next());
+        assertThat(rs.next()).isFalse();
         rs.close();
     }
 
@@ -247,12 +223,12 @@ public class TransactionTest {
 
         // conn1 can see (1+...+7), conn2 can see (1+...+5)
         rs = stat1.executeQuery("select sum(c1) from t;");
-        assertTrue(rs.next());
-        assertEquals(1 + 2 + 3 + 4 + 5 + 6 + 7, rs.getInt(1));
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(1 + 2 + 3 + 4 + 5 + 6 + 7);
         rs.close();
         rs = stat2.executeQuery("select sum(c1) from t;");
-        assertTrue(rs.next());
-        assertEquals(1 + 2 + 3 + 4 + 5, rs.getInt(1));
+        assertThat(rs.next()).isTrue();
+        assertThat(rs.getInt(1)).isEqualTo(1 + 2 + 3 + 4 + 5);
         rs.close();
     }
 
@@ -262,7 +238,7 @@ public class TransactionTest {
         stat1.executeUpdate("insert into t values (1);");
         stat1.executeUpdate("insert into t values (2);");
         ResultSet rs = stat1.executeQuery("select * from t;");
-        assertTrue(rs.next()); // select is open
+        assertThat(rs.next()).isTrue(); // select is open
 
         conn2.setAutoCommit(false);
         stat1.executeUpdate("insert into t values (2);");
@@ -277,26 +253,25 @@ public class TransactionTest {
         stat1.executeUpdate("insert into t values (1);");
         stat1.executeUpdate("insert into t values (2);");
         ResultSet rs = stat1.executeQuery("select * from t;");
-        assertTrue(rs.next());
+        assertThat(rs.next()).isTrue();
 
         final TransactionTest lock = this;
         lock.done = false;
-        new Thread() {
-            @Override
-            public void run() {
-                try {
-                    stat2.executeUpdate("insert into t values (3);");
-                } catch (SQLException e) {
-                    e.printStackTrace();
-                    return;
-                }
+        new Thread(
+                        () -> {
+                            try {
+                                stat2.executeUpdate("insert into t values (3);");
+                            } catch (SQLException e) {
+                                e.printStackTrace();
+                                return;
+                            }
 
-                synchronized (lock) {
-                    lock.done = true;
-                    lock.notify();
-                }
-            }
-        }.start();
+                            synchronized (lock) {
+                                lock.done = true;
+                                lock.notify();
+                            }
+                        })
+                .start();
 
         Thread.sleep(100);
         rs.close();
@@ -318,12 +293,12 @@ public class TransactionTest {
         stat1.executeUpdate("insert into t values (1);");
         stat1.executeUpdate("insert into t values (2);");
         ResultSet rs = stat1.executeQuery("select * from t;");
-        assertTrue(rs.next());
+        assertThat(rs.next()).isTrue();
 
         ((SQLiteConnection) conn2).setBusyTimeout(10);
-        assertThrows(
-                SQLException.class,
-                () -> stat2.executeUpdate("insert into t values (3);")); // can't be done
+        assertThatExceptionOfType(SQLException.class)
+                .isThrownBy(
+                        () -> stat2.executeUpdate("insert into t values (3);")); // can't be done
     }
 
     //    @Test(expected= SQLException.class)
@@ -333,66 +308,61 @@ public class TransactionTest {
         stat1.executeUpdate("insert into t values (1);");
         stat1.executeUpdate("insert into t values (2);");
         ResultSet rs = conn1.createStatement().executeQuery("select * from t;");
-        assertTrue(rs.next());
+        assertThat(rs.next()).isTrue();
 
         // commit now succeeds since sqlite 3.6.5
         stat1.executeUpdate("insert into t values (3);"); // can't be done
     }
 
     @Test
-    public void cantCommit() throws SQLException {
-        assertThrows(SQLException.class, () -> conn1.commit());
+    public void cantCommit() {
+        assertThatExceptionOfType(SQLException.class).isThrownBy(() -> conn1.commit());
     }
 
     @Test
-    public void cantRollback() throws SQLException {
-        assertThrows(SQLException.class, () -> conn1.rollback());
+    public void cantRollback() {
+        assertThatExceptionOfType(SQLException.class).isThrownBy(() -> conn1.rollback());
     }
 
     @Test
-    public void transactionModes() throws Exception {
-        File tmpFile = File.createTempFile("test-trans", ".db");
+    public void transactionModes(@TempDir File tempDir) throws Exception {
+        File tmpFile = File.createTempFile("test-trans", ".db", tempDir);
 
         SQLiteDataSource ds = new SQLiteDataSource();
         ds.setUrl("jdbc:sqlite:" + tmpFile.getAbsolutePath());
 
         // deferred
-        SQLiteConnection con = (SQLiteConnection) ds.getConnection();
-        assertEquals(TransactionMode.DEFERRED, con.getConnectionConfig().getTransactionMode());
-        assertEquals("begin;", con.getConnectionConfig().transactionPrefix());
-        runUpdates(con, "tbl1");
+        try (SQLiteConnection con = (SQLiteConnection) ds.getConnection()) {
+            assertThat(con.getConnectionConfig().getTransactionMode())
+                    .isEqualTo(TransactionMode.DEFERRED);
+            assertThat(con.getConnectionConfig().transactionPrefix()).isEqualTo("begin;");
+            runUpdates(con, "tbl1");
+        }
 
         ds.setTransactionMode(TransactionMode.DEFERRED.name());
-        con = (SQLiteConnection) ds.getConnection();
-        assertEquals(TransactionMode.DEFERRED, con.getConnectionConfig().getTransactionMode());
-        assertEquals("begin;", con.getConnectionConfig().transactionPrefix());
-
-        // Misspelled deferred should be accepted for backwards compatibility
-        ds.setTransactionMode("DEFFERED");
-        con = (SQLiteConnection) ds.getConnection();
-        assertEquals(TransactionMode.DEFERRED, con.getConnectionConfig().getTransactionMode());
-        assertEquals("begin;", con.getConnectionConfig().transactionPrefix());
-
-        con = (SQLiteConnection) ds.getConnection();
-        con.getConnectionConfig().setTransactionMode(TransactionMode.valueOf("DEFFERED"));
-        assertEquals(TransactionMode.DEFERRED, con.getConnectionConfig().getTransactionMode());
-        assertEquals("begin;", con.getConnectionConfig().transactionPrefix());
+        try (SQLiteConnection con = (SQLiteConnection) ds.getConnection()) {
+            assertThat(con.getConnectionConfig().getTransactionMode())
+                    .isEqualTo(TransactionMode.DEFERRED);
+            assertThat(con.getConnectionConfig().transactionPrefix()).isEqualTo("begin;");
+        }
 
         // immediate
         ds.setTransactionMode(TransactionMode.IMMEDIATE.name());
-        con = (SQLiteConnection) ds.getConnection();
-        assertEquals(TransactionMode.IMMEDIATE, con.getConnectionConfig().getTransactionMode());
-        assertEquals("begin immediate;", con.getConnectionConfig().transactionPrefix());
-        runUpdates(con, "tbl2");
+        try (SQLiteConnection con = (SQLiteConnection) ds.getConnection()) {
+            assertThat(con.getConnectionConfig().getTransactionMode())
+                    .isEqualTo(TransactionMode.IMMEDIATE);
+            assertThat(con.getConnectionConfig().transactionPrefix()).isEqualTo("begin immediate;");
+            runUpdates(con, "tbl2");
+        }
 
         // exclusive
         ds.setTransactionMode(TransactionMode.EXCLUSIVE.name());
-        con = (SQLiteConnection) ds.getConnection();
-        assertEquals(TransactionMode.EXCLUSIVE, con.getConnectionConfig().getTransactionMode());
-        assertEquals("begin exclusive;", con.getConnectionConfig().transactionPrefix());
-        runUpdates(con, "tbl3");
-
-        tmpFile.delete();
+        try (SQLiteConnection con = (SQLiteConnection) ds.getConnection()) {
+            assertThat(con.getConnectionConfig().getTransactionMode())
+                    .isEqualTo(TransactionMode.EXCLUSIVE);
+            assertThat(con.getConnectionConfig().transactionPrefix()).isEqualTo("begin exclusive;");
+            runUpdates(con, "tbl3");
+        }
     }
 
     public void runUpdates(Connection con, String table) throws SQLException {
@@ -406,9 +376,9 @@ public class TransactionTest {
 
         ResultSet rs = stat.executeQuery("select * from " + table);
         rs.next();
-        assertEquals(1, rs.getInt(1));
+        assertThat(rs.getInt(1)).isEqualTo(1);
         rs.next();
-        assertEquals(2, rs.getInt(1));
+        assertThat(rs.getInt(1)).isEqualTo(2);
         rs.close();
         con.close();
     }

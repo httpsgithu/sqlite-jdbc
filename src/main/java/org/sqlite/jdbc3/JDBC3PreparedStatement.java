@@ -10,11 +10,13 @@ import java.sql.Array;
 import java.sql.Blob;
 import java.sql.Clob;
 import java.sql.Date;
+import java.sql.JDBCType;
 import java.sql.ParameterMetaData;
 import java.sql.Ref;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -22,6 +24,7 @@ import java.sql.Types;
 import java.util.Calendar;
 import org.sqlite.SQLiteConnection;
 import org.sqlite.core.CorePreparedStatement;
+import org.sqlite.core.DB;
 
 public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
 
@@ -32,7 +35,7 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
     /** @see java.sql.PreparedStatement#clearParameters() */
     public void clearParameters() throws SQLException {
         checkOpen();
-        conn.getDatabase().clear_bindings(pointer);
+        pointer.safeRunConsume(DB::clear_bindings);
         if (batch != null) for (int i = batchPos; i < batchPos + paramCount; i++) batch[i] = null;
     }
 
@@ -40,16 +43,29 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
     public boolean execute() throws SQLException {
         checkOpen();
         rs.close();
-        conn.getDatabase().reset(pointer);
+        pointer.safeRunConsume(DB::reset);
+        exhaustedResults = false;
 
-        boolean success = false;
-        try {
-            resultsWaiting = conn.getDatabase().execute(this, batch);
-            success = true;
-            return columnCount != 0;
-        } finally {
-            if (!success && pointer != 0) conn.getDatabase().reset(pointer);
+        if (this.conn instanceof JDBC3Connection) {
+            ((JDBC3Connection) this.conn).tryEnforceTransactionMode();
         }
+
+        return this.withConnectionTimeout(
+                () -> {
+                    boolean success = false;
+                    try {
+                        synchronized (conn) {
+                            resultsWaiting =
+                                    conn.getDatabase().execute(JDBC3PreparedStatement.this, batch);
+                            updateGeneratedKeys();
+                            success = true;
+                            updateCount = getDatabase().changes();
+                        }
+                        return 0 != columnCount;
+                    } finally {
+                        if (!success && !pointer.isClosed()) pointer.safeRunConsume(DB::reset);
+                    }
+                });
     }
 
     /** @see java.sql.PreparedStatement#executeQuery() */
@@ -61,20 +77,36 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
         }
 
         rs.close();
-        conn.getDatabase().reset(pointer);
+        pointer.safeRunConsume(DB::reset);
+        exhaustedResults = false;
 
-        boolean success = false;
-        try {
-            resultsWaiting = conn.getDatabase().execute(this, batch);
-            success = true;
-        } finally {
-            if (!success && pointer != 0) conn.getDatabase().reset(pointer);
+        if (this.conn instanceof JDBC3Connection) {
+            ((JDBC3Connection) this.conn).tryEnforceTransactionMode();
         }
-        return getResultSet();
+
+        return this.withConnectionTimeout(
+                () -> {
+                    boolean success = false;
+                    try {
+                        resultsWaiting =
+                                conn.getDatabase().execute(JDBC3PreparedStatement.this, batch);
+                        success = true;
+                    } finally {
+                        if (!success && !pointer.isClosed()) {
+                            pointer.safeRunInt(DB::reset);
+                        }
+                    }
+                    return getResultSet();
+                });
     }
 
     /** @see java.sql.PreparedStatement#executeUpdate() */
     public int executeUpdate() throws SQLException {
+        return (int) executeLargeUpdate();
+    }
+
+    /** @see java.sql.PreparedStatement#executeLargeUpdate() */
+    public long executeLargeUpdate() throws SQLException {
         checkOpen();
 
         if (columnCount != 0) {
@@ -82,9 +114,23 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
         }
 
         rs.close();
-        conn.getDatabase().reset(pointer);
+        pointer.safeRunConsume(DB::reset);
+        exhaustedResults = false;
 
-        return conn.getDatabase().executeUpdate(this, batch);
+        if (this.conn instanceof JDBC3Connection) {
+            ((JDBC3Connection) this.conn).tryEnforceTransactionMode();
+        }
+
+        return this.withConnectionTimeout(
+                () -> {
+                    synchronized (conn) {
+                        long rc =
+                                conn.getDatabase()
+                                        .executeUpdate(JDBC3PreparedStatement.this, batch);
+                        updateGeneratedKeys();
+                        return rc;
+                    }
+                });
     }
 
     /** @see java.sql.PreparedStatement#addBatch() */
@@ -123,13 +169,29 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
     }
 
     /** @see java.sql.ParameterMetaData#getParameterTypeName(int) */
-    public String getParameterTypeName(int pos) {
-        return "VARCHAR";
+    public String getParameterTypeName(int pos) throws SQLException {
+        checkIndex(pos);
+        return JDBCType.valueOf(getParameterType(pos)).getName();
     }
 
     /** @see java.sql.ParameterMetaData#getParameterType(int) */
-    public int getParameterType(int pos) {
-        return Types.VARCHAR;
+    public int getParameterType(int pos) throws SQLException {
+        checkIndex(pos);
+        Object paramValue = batch[pos - 1];
+
+        if (paramValue == null) {
+            return Types.NULL;
+        } else if (paramValue instanceof Integer
+                || paramValue instanceof Short
+                || paramValue instanceof Boolean) {
+            return Types.INTEGER;
+        } else if (paramValue instanceof Long) {
+            return Types.BIGINT;
+        } else if (paramValue instanceof Double || paramValue instanceof Float) {
+            return Types.REAL;
+        } else {
+            return Types.VARCHAR;
+        }
     }
 
     /** @see java.sql.ParameterMetaData#getParameterMode(int) */
@@ -177,10 +239,7 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
      */
     private byte[] readBytes(InputStream istream, int length) throws SQLException {
         if (length < 0) {
-            SQLException exception =
-                    new SQLException("Error reading stream. Length should be non-negative");
-
-            throw exception;
+            throw new SQLException("Error reading stream. Length should be non-negative");
         }
 
         byte[] bytes = new byte[length];
@@ -396,55 +455,97 @@ public abstract class JDBC3PreparedStatement extends CorePreparedStatement {
         return (ResultSetMetaData) rs;
     }
 
-    // UNUSED ///////////////////////////////////////////////////////
-    protected SQLException unused() {
-        return new SQLException("not implemented by SQLite JDBC driver");
+    protected SQLException unsupported() {
+        return new SQLFeatureNotSupportedException("not implemented by SQLite JDBC driver");
+    }
+
+    protected SQLException invalid() {
+        return new SQLException("method cannot be called on a PreparedStatement");
     }
 
     // PreparedStatement ////////////////////////////////////////////
 
     public void setArray(int i, Array x) throws SQLException {
-        throw unused();
+        throw unsupported();
     }
-    //    public void setBigDecimal(int parameterIndex, BigDecimal x)
-    //        throws SQLException { throw unused(); }
+
     public void setBlob(int i, Blob x) throws SQLException {
-        throw unused();
+        throw unsupported();
     }
 
     public void setClob(int i, Clob x) throws SQLException {
-        throw unused();
+        throw unsupported();
     }
 
     public void setRef(int i, Ref x) throws SQLException {
-        throw unused();
+        throw unsupported();
     }
 
     public void setURL(int pos, URL x) throws SQLException {
-        throw unused();
+        throw unsupported();
     }
 
     /** @see org.sqlite.core.CoreStatement#exec(java.lang.String) */
     @Override
     public boolean execute(String sql) throws SQLException {
-        throw unused();
+        throw invalid();
+    }
+
+    public boolean execute(String sql, int autoGeneratedKeys) throws SQLException {
+        throw invalid();
+    }
+
+    public boolean execute(String sql, int[] colinds) throws SQLException {
+        throw invalid();
+    }
+
+    public boolean execute(String sql, String[] colnames) throws SQLException {
+        throw invalid();
     }
 
     /** @see org.sqlite.core.CoreStatement#exec(java.lang.String) */
     @Override
     public int executeUpdate(String sql) throws SQLException {
-        throw unused();
+        throw invalid();
+    }
+
+    public int executeUpdate(String sql, int autoGeneratedKeys) throws SQLException {
+        throw invalid();
+    }
+
+    public int executeUpdate(String sql, int[] colinds) throws SQLException {
+        throw invalid();
+    }
+
+    public int executeUpdate(String sql, String[] cols) throws SQLException {
+        throw invalid();
+    }
+
+    public long executeLargeUpdate(String sql) throws SQLException {
+        throw invalid();
+    }
+
+    public long executeLargeUpdate(String sql, int autoGeneratedKeys) throws SQLException {
+        throw invalid();
+    }
+
+    public long executeLargeUpdate(String sql, int[] colinds) throws SQLException {
+        throw invalid();
+    }
+
+    public long executeLargeUpdate(String sql, String[] cols) throws SQLException {
+        throw invalid();
     }
 
     /** @see org.sqlite.core.CoreStatement#exec(String) */
     @Override
     public ResultSet executeQuery(String sql) throws SQLException {
-        throw unused();
+        throw invalid();
     }
 
     /** */
     @Override
     public void addBatch(String sql) throws SQLException {
-        throw unused();
+        throw invalid();
     }
 }

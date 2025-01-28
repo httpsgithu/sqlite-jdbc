@@ -54,7 +54,7 @@ public class ExtendedCommand {
         if (s == null) return s;
 
         if ((s.startsWith("\"") && s.endsWith("\"")) || (s.startsWith("'") && s.endsWith("'")))
-            return s.substring(1, s.length() - 1);
+            return (s.length() >= 2) ? s.substring(1, s.length() - 1) : s;
         else return s;
     }
 
@@ -100,7 +100,11 @@ public class ExtendedCommand {
         }
 
         public void execute(DB db) throws SQLException {
-            db.backup(srcDB, destFile, null);
+            int rc = db.backup(srcDB, destFile, null);
+
+            if (rc != SQLiteErrorCode.SQLITE_OK.code) {
+                throw DB.newSQLException(rc, "Backup failed");
+            }
         }
     }
 
@@ -145,7 +149,11 @@ public class ExtendedCommand {
 
         /** @see org.sqlite.ExtendedCommand.SQLExtension#execute(org.sqlite.core.DB) */
         public void execute(DB db) throws SQLException {
-            db.restore(targetDB, srcFile, null);
+            int rc = db.restore(targetDB, srcFile, null);
+
+            if (rc != SQLiteErrorCode.SQLITE_OK.code) {
+                throw DB.newSQLException(rc, "Restore failed");
+            }
         }
     }
 }

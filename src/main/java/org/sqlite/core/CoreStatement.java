@@ -17,27 +17,40 @@ package org.sqlite.core;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.regex.Pattern;
 import org.sqlite.SQLiteConnection;
 import org.sqlite.SQLiteConnectionConfig;
+import org.sqlite.jdbc3.JDBC3Connection;
 import org.sqlite.jdbc4.JDBC4ResultSet;
 
 public abstract class CoreStatement implements Codes {
     public final SQLiteConnection conn;
     protected final CoreResultSet rs;
 
-    public long pointer;
+    public SafeStmtPtr pointer;
     protected String sql = null;
 
     protected int batchPos;
     protected Object[] batch = null;
     protected boolean resultsWaiting = false;
 
+    private Statement generatedKeysStat = null;
+    private ResultSet generatedKeysRs = null;
+
+    // pattern for matching insert statements of the general format starting with INSERT or REPLACE.
+    // CTEs used prior to the insert or replace keyword are also be permitted.
+    private static final Pattern INSERT_PATTERN =
+            Pattern.compile(
+                    "^\\s*(?:with\\s+.+\\(.+?\\))*\\s*(?:insert|replace)\\s*",
+                    Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
+
     protected CoreStatement(SQLiteConnection c) {
         conn = c;
         rs = new JDBC4ResultSet(this);
     }
 
-    public DB getDatbase() {
+    public DB getDatabase() {
         return conn.getDatabase();
     }
 
@@ -47,7 +60,7 @@ public abstract class CoreStatement implements Codes {
 
     /** @throws SQLException If the database is not opened. */
     protected final void checkOpen() throws SQLException {
-        if (pointer == 0) throw new SQLException("statement is not executing");
+        if (pointer.isClosed()) throw new SQLException("statement is not executing");
     }
 
     /**
@@ -55,7 +68,7 @@ public abstract class CoreStatement implements Codes {
      * @throws SQLException
      */
     boolean isOpen() throws SQLException {
-        return (pointer != 0);
+        return !pointer.isClosed();
     }
 
     /**
@@ -68,17 +81,24 @@ public abstract class CoreStatement implements Codes {
         if (sql == null) throw new SQLException("SQLiteJDBC internal error: sql==null");
         if (rs.isOpen()) throw new SQLException("SQLite JDBC internal error: rs.isOpen() on exec.");
 
+        if (this.conn instanceof JDBC3Connection) {
+            ((JDBC3Connection) this.conn).tryEnforceTransactionMode();
+        }
+
         boolean success = false;
         boolean rc = false;
         try {
             rc = conn.getDatabase().execute(this, null);
             success = true;
         } finally {
+            notifyFirstStatementExecuted();
             resultsWaiting = rc;
-            if (!success) conn.getDatabase().finalize(this);
+            if (!success) {
+                this.pointer.close();
+            }
         }
 
-        return conn.getDatabase().column_count(pointer) != 0;
+        return pointer.safeRunInt(DB::column_count) != 0;
     }
 
     /**
@@ -93,31 +113,98 @@ public abstract class CoreStatement implements Codes {
         if (sql == null) throw new SQLException("SQLiteJDBC internal error: sql==null");
         if (rs.isOpen()) throw new SQLException("SQLite JDBC internal error: rs.isOpen() on exec.");
 
+        if (this.conn instanceof JDBC3Connection) {
+            ((JDBC3Connection) this.conn).tryEnforceTransactionMode();
+        }
+
         boolean rc = false;
         boolean success = false;
         try {
             rc = conn.getDatabase().execute(sql, conn.getAutoCommit());
             success = true;
         } finally {
+            notifyFirstStatementExecuted();
             resultsWaiting = rc;
-            if (!success) conn.getDatabase().finalize(this);
+            if (!success && pointer != null) {
+                pointer.close();
+            }
         }
 
-        return conn.getDatabase().column_count(pointer) != 0;
+        return pointer.safeRunInt(DB::column_count) != 0;
     }
 
     protected void internalClose() throws SQLException {
-        if (pointer == 0) return;
-        if (conn.isClosed()) throw DB.newSQLException(SQLITE_ERROR, "Connection is closed");
+        if (this.pointer != null && !this.pointer.isClosed()) {
+            if (conn.isClosed()) throw DB.newSQLException(SQLITE_ERROR, "Connection is closed");
 
-        rs.close();
+            rs.close();
 
-        batch = null;
-        batchPos = 0;
-        int resp = conn.getDatabase().finalize(this);
+            batch = null;
+            batchPos = 0;
+            int resp = this.pointer.close();
 
-        if (resp != SQLITE_OK && resp != SQLITE_MISUSE) conn.getDatabase().throwex(resp);
+            if (resp != SQLITE_OK && resp != SQLITE_MISUSE) conn.getDatabase().throwex(resp);
+        }
+    }
+
+    protected void notifyFirstStatementExecuted() {
+        conn.setFirstStatementExecuted(true);
     }
 
     public abstract ResultSet executeQuery(String sql, boolean closeStmt) throws SQLException;
+
+    protected void checkIndex(int index) throws SQLException {
+        if (batch == null) {
+            throw new SQLException("No parameter has been set yet");
+        }
+        if (index < 1 || index > batch.length) {
+            throw new SQLException("Parameter index is invalid");
+        }
+    }
+
+    protected void clearGeneratedKeys() throws SQLException {
+        if (generatedKeysRs != null && !generatedKeysRs.isClosed()) {
+            generatedKeysRs.close();
+        }
+        generatedKeysRs = null;
+        if (generatedKeysStat != null && !generatedKeysStat.isClosed()) {
+            generatedKeysStat.close();
+        }
+        generatedKeysStat = null;
+    }
+
+    /**
+     * SQLite's last_insert_rowid() function is DB-specific. However, in this implementation we
+     * ensure the Generated Key result set is statement-specific by executing the query immediately
+     * after an insert operation is performed. The caller is simply responsible for calling
+     * updateGeneratedKeys on the statement object right after execute in a synchronized(connection)
+     * block.
+     */
+    public void updateGeneratedKeys() throws SQLException {
+        if (conn.getConnectionConfig().isGetGeneratedKeys()) {
+            clearGeneratedKeys();
+            if (sql != null && INSERT_PATTERN.matcher(sql).find()) {
+                generatedKeysStat = conn.createStatement();
+                generatedKeysRs = generatedKeysStat.executeQuery("SELECT last_insert_rowid();");
+            }
+        }
+    }
+
+    /**
+     * This implementation uses SQLite's last_insert_rowid function to obtain the row ID. It cannot
+     * provide multiple values when inserting multiple rows. Suggestion is to use a <a
+     * href=https://www.sqlite.org/lang_returning.html>RETURNING</a> clause instead.
+     *
+     * @see java.sql.Statement#getGeneratedKeys()
+     */
+    public ResultSet getGeneratedKeys() throws SQLException {
+        // getGeneratedKeys is required to return an EmptyResult set if the statement
+        // did not generate any keys. Thus, if the generateKeysResultSet is NULL, spin
+        // up a new result set without any contents by issuing a query with a false where condition
+        if (generatedKeysRs == null) {
+            generatedKeysStat = conn.createStatement();
+            generatedKeysRs = generatedKeysStat.executeQuery("SELECT 1 WHERE 1 = 2;");
+        }
+        return generatedKeysRs;
+    }
 }

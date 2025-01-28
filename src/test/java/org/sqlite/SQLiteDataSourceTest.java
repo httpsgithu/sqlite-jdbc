@@ -9,11 +9,12 @@
 // --------------------------------------
 package org.sqlite;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.ByteOrder;
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -22,18 +23,17 @@ import org.junit.jupiter.api.Test;
 public class SQLiteDataSourceTest {
 
     @BeforeEach
-    public void setUp() throws Exception {}
+    public void setUp() {}
 
     @AfterEach
-    public void tearDown() throws Exception {}
+    public void tearDown() {}
 
     @Test
     public void enumParam() throws Exception {
 
         SQLiteDataSource ds = new SQLiteDataSource();
-        Connection conn = ds.getConnection();
-        Statement stat = conn.createStatement();
-        try {
+        try (Connection conn = ds.getConnection();
+                Statement stat = conn.createStatement()) {
 
             stat.executeUpdate("create table A (id integer, name)");
             stat.executeUpdate("insert into A values(1, 'leo')");
@@ -43,14 +43,10 @@ public class SQLiteDataSourceTest {
                 count++;
                 int id = rs.getInt(1);
                 String name = rs.getString(2);
-                assertEquals(1, id);
-                assertEquals("leo", name);
+                assertThat(id).isEqualTo(1);
+                assertThat(name).isEqualTo("leo");
             }
-            assertEquals(1, count);
-
-        } finally {
-            stat.close();
-            conn.close();
+            assertThat(count).isEqualTo(1);
         }
     }
 
@@ -78,16 +74,55 @@ public class SQLiteDataSourceTest {
             SQLiteDataSource ds = new SQLiteDataSource();
             ds.setEncoding(configArray[i]);
 
-            Connection conn = ds.getConnection();
-            Statement stat = conn.createStatement();
-            try {
-
+            try (Connection conn = ds.getConnection();
+                    Statement stat = conn.createStatement()) {
                 ResultSet rs = stat.executeQuery("pragma encoding");
-                assertEquals(encodingArray[i / 3], rs.getString(1));
-            } finally {
-                stat.close();
-                conn.close();
+                assertThat(rs.getString(1)).isEqualTo(encodingArray[i / 3]);
             }
         }
+    }
+
+    @Test
+    public void setBusyTimeout() {
+        final SQLiteDataSource ds = new SQLiteDataSource();
+        ds.setBusyTimeout(1234);
+        assertThat(
+                        ds.getConfig()
+                                .toProperties()
+                                .getProperty(SQLiteConfig.Pragma.BUSY_TIMEOUT.pragmaName))
+                .isEqualTo("1234");
+        assertThat(ds.getConfig().getBusyTimeout()).isEqualTo(1234);
+    }
+
+    @Test
+    public void setGetGeneratedKeys() throws SQLException {
+        final SQLiteDataSource ds = new SQLiteDataSource();
+        ds.setGetGeneratedKeys(false);
+        assertThat(
+                        ds.getConfig()
+                                .toProperties()
+                                .getProperty(
+                                        SQLiteConfig.Pragma.JDBC_GET_GENERATED_KEYS.pragmaName))
+                .isEqualTo("false");
+        assertThat(ds.getConfig().isGetGeneratedKeys()).isEqualTo(false);
+        assertThat(
+                        ((SQLiteConnection) ds.getConnection())
+                                .getConnectionConfig()
+                                .isGetGeneratedKeys())
+                .isFalse();
+
+        ds.setGetGeneratedKeys(true);
+        assertThat(
+                        ds.getConfig()
+                                .toProperties()
+                                .getProperty(
+                                        SQLiteConfig.Pragma.JDBC_GET_GENERATED_KEYS.pragmaName))
+                .isEqualTo("true");
+        assertThat(ds.getConfig().isGetGeneratedKeys()).isEqualTo(true);
+        assertThat(
+                        ((SQLiteConnection) ds.getConnection())
+                                .getConnectionConfig()
+                                .isGetGeneratedKeys())
+                .isTrue();
     }
 }

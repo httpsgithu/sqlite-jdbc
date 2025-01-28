@@ -47,6 +47,7 @@ public class OSInfo {
     public static final String IA64 = "ia64";
     public static final String PPC = "ppc";
     public static final String PPC64 = "ppc64";
+    public static final String RISCV64 = "riscv64";
 
     static {
         // x86 mappings
@@ -63,11 +64,11 @@ public class OSInfo {
         archMapping.put("em64t", X86_64);
         archMapping.put("universal", X86_64); // Needed for openjdk7 in Mac
 
-        // Itenium 64-bit mappings
+        // Itanium 64-bit mappings
         archMapping.put(IA64, IA64);
         archMapping.put("ia64w", IA64);
 
-        // Itenium 32-bit mappings, usually an HP-UX construct
+        // Itanium 32-bit mappings, usually an HP-UX construct
         archMapping.put(IA64_32, IA64_32);
         archMapping.put("ia64n", IA64_32);
 
@@ -84,6 +85,10 @@ public class OSInfo {
         archMapping.put("powerpc64", PPC64);
         archMapping.put("power_pc64", PPC64);
         archMapping.put("power_rs64", PPC64);
+        archMapping.put("ppc64el", PPC64);
+        archMapping.put("ppc64le", PPC64);
+
+        archMapping.put(RISCV64, RISCV64);
     }
 
     public static void main(String[] args) {
@@ -109,7 +114,19 @@ public class OSInfo {
     }
 
     public static boolean isAndroid() {
+        return isAndroidRuntime() || isAndroidTermux();
+    }
+
+    public static boolean isAndroidRuntime() {
         return System.getProperty("java.runtime.name", "").toLowerCase().contains("android");
+    }
+
+    public static boolean isAndroidTermux() {
+        try {
+            return processRunner.runAndWaitFor("uname -o").toLowerCase().contains("android");
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     public static boolean isMusl() {
@@ -125,7 +142,17 @@ public class OSInfo {
                                 }
                             })
                     .anyMatch(s -> s.toLowerCase().contains("musl"));
-        } catch (IOException ignored) {
+        } catch (Exception ignored) {
+            // fall back to checking for alpine linux in the event we're using an older kernel which
+            // may not fail the above check
+            return isAlpineLinux();
+        }
+    }
+
+    private static boolean isAlpineLinux() {
+        try (Stream<String> osLines = Files.lines(Paths.get("/etc/os-release"))) {
+            return osLines.anyMatch(l -> l.startsWith("ID") && l.contains("alpine"));
+        } catch (Exception ignored2) {
         }
         return false;
     }
@@ -134,7 +161,7 @@ public class OSInfo {
         try {
             return processRunner.runAndWaitFor("uname -m");
         } catch (Throwable e) {
-            System.err.println("Error while running uname -m: " + e.getMessage());
+            LogHolder.logger.error(() -> "Error while running uname -m", e);
             return "unknown";
         }
     }
@@ -165,8 +192,14 @@ public class OSInfo {
                 // Use armv5, soft-float ABI
                 return "arm";
             } else if (armType.startsWith("aarch64")) {
-                // Use arm64
-                return "aarch64";
+                boolean is32bitJVM = "32".equals(System.getProperty("sun.arch.data.model"));
+                if (is32bitJVM) {
+                    // An aarch64 architecture should support armv7
+                    return "armv7";
+                } else {
+                    // Use arm64
+                    return "aarch64";
+                }
             }
 
             // Java 1.8 introduces a system property to determine armel or armhf
@@ -176,7 +209,7 @@ public class OSInfo {
                 return "armv7";
             }
 
-            // For java7, we stil need to if run some shell commands to determine ABI of JVM
+            // For java7, we still need to run some shell commands to determine ABI of JVM
             String javaHome = System.getProperty("java.home");
             try {
                 // determine if first JVM found uses ARM hard-float ABI
@@ -195,8 +228,9 @@ public class OSInfo {
                         return "armv7";
                     }
                 } else {
-                    System.err.println(
-                            "WARNING! readelf not found. Cannot check if running on an armhf system, armel architecture will be presumed.");
+                    LogHolder.logger.warn(
+                            () ->
+                                    "readelf not found. Cannot check if running on an armhf system, armel architecture will be presumed");
                 }
             } catch (IOException | InterruptedException e) {
                 // ignored: fall back to "arm" arch (soft-float ABI)
@@ -207,6 +241,11 @@ public class OSInfo {
     }
 
     public static String getArchName() {
+        String override = System.getProperty("org.sqlite.osinfo.architecture");
+        if (override != null) {
+            return override;
+        }
+
         String osArch = System.getProperty("os.arch");
 
         if (osArch.startsWith("arm")) {
@@ -223,14 +262,14 @@ public class OSInfo {
             return "Windows";
         } else if (osName.contains("Mac") || osName.contains("Darwin")) {
             return "Mac";
+        } else if (osName.contains("AIX")) {
+            return "AIX";
         } else if (isMusl()) {
             return "Linux-Musl";
         } else if (isAndroid()) {
             return "Linux-Android";
         } else if (osName.contains("Linux")) {
             return "Linux";
-        } else if (osName.contains("AIX")) {
-            return "AIX";
         } else {
             return osName.replaceAll("\\W", "");
         }
@@ -238,5 +277,13 @@ public class OSInfo {
 
     static String translateArchNameToFolderName(String archName) {
         return archName.replaceAll("\\W", "");
+    }
+
+    /**
+     * Class-wrapper around the logger object to avoid build-time initialization of the logging
+     * framework in native-image
+     */
+    private static class LogHolder {
+        private static final Logger logger = LoggerFactory.getLogger(OSInfo.class);
     }
 }
